@@ -21,10 +21,13 @@ class AnalyzerTests(unittest.TestCase):
     def row(self, user, host, status='TUNNEL/200', server='192.0.2.1', date='2026-10-27 08:03:56.087'):
         return [date, '44.100.230.120', 'TCP', status, '705521', 'CONNECT', host, '443', user, 'HIER_DIRECT', server]
 
-    def run_tool(self, *extra, expected=0):
+    def run_tool(self, *extra, expected=0, discover=False):
         with (self.root / 'logs' / 'log.csv').open('w', newline='') as f:
             csv.writer(f, delimiter=';', quoting=csv.QUOTE_ALL).writerows(self.records)
         cmd = [sys.executable, str(SCRIPT), '--logs', str(self.root / 'logs'), '--users', str(self.root / 'users.csv'), '--resources', str(self.root / 'resources.csv'), '--out', str(self.root / 'reports'), *extra]
+        if discover:
+            position = cmd.index('--resources')
+            del cmd[position:position+2]
         result = subprocess.run(cmd, text=True, capture_output=True)
         self.assertEqual(result.returncode, expected, result.stderr)
         return result
@@ -100,6 +103,61 @@ class AnalyzerTests(unittest.TestCase):
         (self.root / 'users.csv').write_text('login\nAlice\nalice\n')
         self.run_tool(expected=1)
         self.assertFalse((self.root / 'reports').exists())
+
+    def test_discovery_and_zero_activity_coverage(self):
+        (self.root / 'resources.csv').unlink()
+        self.records.append(self.row('UnlistedUser', 'unknown.example.com', server='192.0.2.50'))
+        self.run_tool(discover=True)
+        resources = {r['resource'] for r in self.report('resources')}
+        self.assertEqual(resources, {'software.com', 'docs.example.com', 'other.example.com', 'unknown.example.com'})
+        self.assertEqual(len(self.report('user_resource_coverage')), 12)
+        missing = {(r['login'], r['resource']) for r in self.report('missing_user_resources')}
+        self.assertIn(('Bob', 'software.com'), missing)
+        self.assertNotIn(('Alice', 'docs.example.com'), missing)
+        self.assertEqual(self.report('no_log_activity'), [{'login': 'Carol'}])
+        summary = json.loads((self.root / 'reports' / 'summary.json').read_text())
+        self.assertEqual(summary['resource_mode'], 'discovered')
+        self.assertEqual(summary['listed_resources'], 4)
+
+    def test_discovery_normalizes_domains_and_retains_distinct_ips(self):
+        self.records = [self.row('Alice', 'SOFTWARE.com'), self.row('Alice', 'software.com', server='192.0.2.9'), self.row('Bob', 'software.com'), self.row('Bob', 'other.example.com')]
+        self.run_tool(discover=True)
+        resources = self.report('resources')
+        self.assertEqual(len(resources), 3)
+        self.assertEqual({r['ip'] for r in resources if r['resource'] == 'software.com'}, {'192.0.2.1', '192.0.2.9'})
+        self.assertEqual(len({r['resource'] for r in resources}), 2)
+        coverage = [r for r in self.report('user_resource_coverage') if r['login'] == 'Alice' and r['resource'] == 'software.com']
+        self.assertEqual(coverage[0]['attempts'], '2')
+
+    def test_failed_missing_ip_and_direct_ip_are_discovered(self):
+        self.records = [self.row('Alice', 'blocked.example.com', 'TCP_DENIED/403', server='-'), self.row('Bob', '2001:db8::1', server='-')]
+        self.run_tool(discover=True)
+        resources = {r['resource']: r for r in self.report('resources')}
+        self.assertEqual(resources['blocked.example.com']['ip'], '')
+        self.assertEqual(resources['2001:db8::1']['ip'], '2001:db8::1')
+        no_success = {(r['login'], r['resource']) for r in self.report('no_success_user_resources')}
+        self.assertIn(('Alice', 'blocked.example.com'), no_success)
+        self.assertNotIn(('Alice', 'blocked.example.com'), {(r['login'], r['resource']) for r in self.report('missing_user_resources')})
+
+    def test_discovery_uses_selected_period_and_rejects_bad_rows(self):
+        self.records = [self.row('Alice', 'old.example.com'), self.row('Bob', 'new.example.com', date='2026-10-28 00:00:00'), ['bad']]
+        self.run_tool('--from-date', '2026-10-28', discover=True, expected=2)
+        self.assertEqual({r['resource'] for r in self.report('resources')}, {'new.example.com'})
+
+    def test_empty_discovery_has_no_resources(self):
+        self.run_tool('--from-date', '2027-01-01', discover=True, expected=2)
+        self.assertEqual(self.report('resources'), [])
+        self.assertEqual(self.report('user_resource_coverage'), [])
+        self.assertEqual(len(self.report('no_log_activity')), 3)
+
+    def test_generated_resources_can_be_reused(self):
+        self.run_tool(discover=True)
+        generated = self.root / 'reports' / 'resources.csv'
+        expected = self.report('user_resource_coverage')
+        result = subprocess.run([sys.executable, str(SCRIPT), '--logs', str(self.root / 'logs'), '--users', str(self.root / 'users.csv'), '--resources', str(generated), '--out', str(self.root / 'reuse')], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        with (self.root / 'reuse' / 'user_resource_coverage.csv').open(encoding='utf-8-sig') as f:
+            self.assertEqual(list(csv.DictReader(f)), expected)
 
 if __name__ == '__main__':
     unittest.main()

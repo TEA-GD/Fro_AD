@@ -71,7 +71,7 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--logs', required=True, type=Path)
     p.add_argument('--users', required=True, type=Path)
-    p.add_argument('--resources', required=True, type=Path)
+    p.add_argument('--resources', type=Path, help='Optional existing resource CSV; otherwise discover resources from logs')
     p.add_argument('--out', required=True, type=Path, help='New output directory; must not exist')
     p.add_argument('--pattern', default='*.csv', help='Recursive log filename pattern')
     p.add_argument('--encoding', default='utf-8-sig')
@@ -104,7 +104,8 @@ def main():
             raise ValueError(f'{a.users}:{line}: duplicate normalized login {login}')
         users[key] = login
     domains, ips, resources = {}, {}, set()
-    for line, row in read_reference(a.resources, a.encoding, {'resource', 'domain', 'ip'}):
+    reference_rows = read_reference(a.resources, a.encoding, {'resource', 'domain', 'ip'}) if a.resources else []
+    for line, row in reference_rows:
         resource = row['resource']
         if not resource or not (row['domain'] or row['ip']):
             raise ValueError(f'{a.resources}:{line}: resource and domain or IP required')
@@ -119,11 +120,13 @@ def main():
         if row['ip']:
             ip = str(ipaddress.ip_address(row['ip']))
             ips.setdefault(ip, set()).add(resource)
-    if not users or not resources:
-        raise ValueError('User and resource reference lists must both contain data')
+    if not users or (a.resources and not resources):
+        raise ValueError('User and supplied resource reference lists must contain data')
     if a.out.resolve().is_relative_to(a.logs.resolve()):
         raise ValueError('Output folder must be outside the log folder')
-    excluded = {a.users.resolve(), a.resources.resolve()}
+    excluded = {a.users.resolve()}
+    if a.resources:
+        excluded.add(a.resources.resolve())
     files = sorted(f for f in a.logs.rglob(a.pattern) if f.is_file() and f.resolve() not in excluded)
     if not files:
         raise ValueError('No matching log files found')
@@ -136,7 +139,7 @@ def main():
         db.executemany('INSERT INTO users VALUES(?,?)', users.items())
         db.execute('CREATE TABLE resources(resource TEXT PRIMARY KEY)')
         db.executemany('INSERT INTO resources VALUES(?)', ((r,) for r in sorted(resources)))
-        db.execute('CREATE TABLE events(login TEXT, source TEXT, resource TEXT, host TEXT, status TEXT, outcome TEXT, timestamp TEXT)')
+        db.execute('CREATE TABLE events(login TEXT, source TEXT, resource TEXT, host TEXT, status TEXT, outcome TEXT, timestamp TEXT, server_ip TEXT)')
         with (a.out / 'rejected_rows.csv').open('w', encoding='utf-8-sig', newline='') as reject_file:
             rejects = csv.writer(reject_file)
             rejects.writerow(['file', 'line', 'reason'])
@@ -187,21 +190,32 @@ def main():
                             resource = next(iter(candidates))
                         elif not resource and len(candidates) > 1:
                             summary['ambiguous_ip'] += 1
+                        if not a.resources:
+                            # Each exact observed host is its own resource; never merge shared IPs.
+                            resource = target
+                        try:
+                            observed_ip = str(ipaddress.ip_address(server))
+                        except ValueError:
+                            observed_ip = direct_ip or ''
                         user = normalize(login) if login and login != '-' else '(anonymous)'
-                        batch.append((user, client, resource, target, status, outcome, when.isoformat(sep=' ')))
+                        batch.append((user, client, resource, target, status, outcome, when.isoformat(sep=' '), observed_ip))
                         summary['parsed'] += 1
                     except (ValueError, IndexError, UnicodeError) as e:
                         summary['rejected'] += 1
                         rejects.writerow([str(file), line, str(e)])
                     if len(batch) >= 10000:
-                        db.executemany('INSERT INTO events VALUES(?,?,?,?,?,?,?)', batch)
+                        db.executemany('INSERT INTO events VALUES(?,?,?,?,?,?,?,?)', batch)
                         batch.clear()
-                db.executemany('INSERT INTO events VALUES(?,?,?,?,?,?,?)', batch)
+                db.executemany('INSERT INTO events VALUES(?,?,?,?,?,?,?,?)', batch)
                 db.commit()
+        if not a.resources:
+            db.execute('INSERT INTO resources SELECT DISTINCT resource FROM events')
+            db.commit()
         db.executescript('CREATE INDEX event_login ON events(login); CREATE INDEX event_pair ON events(login,resource);')
         summary['first_record'], summary['last_record'] = db.execute('SELECT MIN(timestamp),MAX(timestamp) FROM events').fetchone()
         summary['supplied_users'] = len(users)
-        summary['listed_resources'] = len(resources)
+        summary['listed_resources'] = db.execute('SELECT COUNT(*) FROM resources').fetchone()[0]
+        summary['resource_mode'] = 'reference' if a.resources else 'discovered'
         summary['input_files'] = [str(f.resolve()) for f in files]
         summary['arguments'] = {k: str(v) if isinstance(v, (Path, dt.date)) else v for k, v in vars(a).items()}
         queries = {
@@ -236,6 +250,9 @@ def main():
             'daily_activity': '''SELECT substr(timestamp,1,10) AS date,COALESCE(u.display,e.login) AS login,
               COUNT(*) AS connections FROM events e LEFT JOIN users u ON u.login=e.login GROUP BY date,e.login ORDER BY date,login'''
         }
+        if not a.resources:
+            queries = {'resources': '''SELECT DISTINCT resource,host AS domain,server_ip AS ip
+              FROM events ORDER BY resource,ip''', **queries}
         previews = []
         for name, query in queries.items():
             cursor = db.execute(query)
@@ -251,6 +268,8 @@ def main():
         <h1>Proxy activity report</h1><p>Counts represent log records / connection attempts, not page visits or time spent.
         Success means HTTP 2xx/3xx or a tunnel opened; it does not prove that the application worked.
         Missing activity applies only to these supplied logs and filters. Client IP is the recorded source; no geographic location is inferred.</p>'''
+        if not a.resources:
+            page += '<p>Resources were discovered from valid records in the selected period. Each exact destination host is one resource. Resources absent from all supplied records cannot be discovered.</p>'
         if not summary['parsed']:
             page += '<p><strong>No valid records in the selected period. Absence reports cannot establish actual inactivity.</strong></p>'
         page += '<p>' + html.escape(f"Period: {summary['first_record']} — {summary['last_record']}. Included: {summary['parsed']:,}; rejected: {summary['rejected']:,}; outside filter: {summary['outside_period']:,}.") + '</p>'
